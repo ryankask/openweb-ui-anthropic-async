@@ -39,16 +39,22 @@ lint file:
 # Check syntax of main files
 lint-all:
     uv run python -m py_compile anthropic_async.py
-    uv run python -m py_compile existing-code/anthropic_sync.py
-    uv run python -m py_compile existing-code/openwebui_functions.py
+
+# Format code with black
+format:
+    uv run black .
+
+# Lint code with ruff
+lint-ruff:
+    uv run ruff check .
+
+# Lint and fix with ruff
+lint-fix:
+    uv run ruff check . --fix
 
 # Run the main async module
 run:
     uv run python anthropic_async.py
-
-# Run the sync version
-run-sync:
-    uv run python existing-code/anthropic_sync.py
 
 # Install dependencies
 install:

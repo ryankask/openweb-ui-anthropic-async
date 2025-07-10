@@ -15,7 +15,7 @@ An async implementation of the Anthropic Claude integration for OpenWebUI, conve
 
 1. Install dependencies:
    ```bash
-   pip install aiohttp pydantic
+   uv sync
    ```
 
 2. Set your Anthropic API key:
@@ -51,8 +51,8 @@ Comprehensive integration tests using pytest test all functionality against the 
 
 ### Setup
 ```bash
-# Install test dependencies
-pip install -e .[test]
+# Install dependencies including test dependencies
+uv sync
 
 # Set API key
 export ANTHROPIC_API_KEY=your_api_key_here
@@ -61,15 +61,19 @@ export ANTHROPIC_API_KEY=your_api_key_here
 ### Run Tests
 ```bash
 # Run all tests
-python run_tests.py
-
-# Or use pytest directly
-pytest tests/ -v
+just test
 
 # Run specific test categories
-pytest tests/ -m streaming -v    # Only streaming tests
-pytest tests/ -m images -v       # Only image tests
-pytest tests/ -m "not slow" -v   # Skip slow tests
+just test-streaming    # Only streaming tests
+just test-images       # Only image tests
+just test-errors       # Only error handling tests
+just test-slow         # Only slow tests
+
+# Run tests by name pattern
+just test-name "image_url"
+
+# Or use pytest directly
+uv run pytest tests/ -v
 ```
 
 ### Test Coverage
@@ -90,5 +94,29 @@ pytest tests/ -m "not slow" -v   # Skip slow tests
 5. **Performance**: Better handling of concurrent requests
 
 ## Development
+
+### Available Commands
+
+This project uses [just](https://github.com/casey/just) for task automation:
+
+```bash
+# Show all available commands
+just
+
+# Run tests
+just test
+just test-streaming
+just test-images
+
+# Code quality
+just format        # Format with black
+just lint-ruff     # Lint with ruff
+just lint-fix      # Lint and auto-fix
+
+# Development
+just run           # Run the main module
+just install       # Install dependencies
+just update        # Update dependencies
+```
 
 This project uses [opencode](https://opencode.ai) as a copilot for development assistance.
