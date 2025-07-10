@@ -8,12 +8,13 @@ required_open_webui_version: 0.3.17
 license: MIT
 """
 
-import os
-import requests
 import json
-import time
-from typing import List, Union, Generator, Iterator
+import os
+from collections.abc import Generator, Iterator
+
+import requests
 from pydantic import BaseModel, Field
+
 from open_webui.utils.misc import pop_system_message
 
 
@@ -37,7 +38,7 @@ class Pipe:
             {"id": "claude-opus-4-20250514", "name": "claude-opus-4"},
         ]
 
-    def pipes(self) -> List[dict]:
+    def pipes(self) -> list[dict]:
         return self.get_anthropic_models()
 
     def process_image(self, image_data):
@@ -77,7 +78,7 @@ class Pipe:
                 "source": {"type": "url", "url": url},
             }
 
-    def pipe(self, body: dict) -> Union[str, Generator, Iterator]:
+    def pipe(self, body: dict) -> str | Generator | Iterator:
         system_message, messages = pop_system_message(body["messages"])
 
         processed_messages = []
