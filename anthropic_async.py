@@ -1,9 +1,9 @@
 """
 title: Anthropic Manifold Pipe (Async)
 authors: justinh-rahb, christian-taillon, Ryan Kaskel
-author_url: https://github.com/justinh-rahb
+author_url: https://github.com/ryankask
 funding_url: https://github.com/open-webui
-version: 1.1.0
+version: 2.0.0
 required_open_webui_version: 0.3.17
 license: MIT
 """
@@ -114,17 +114,29 @@ class Pipe:
                 {"role": message["role"], "content": processed_content}
             )
 
+        model_id = body["model"][body["model"].find(".") + 1 :]
+
+        # Extract optional parameters only if explicitly provided
+        temperature = body.get("temperature")
+        top_p = body.get("top_p")
+        top_k = body.get("top_k")
+
         payload = {
-            "model": body["model"][body["model"].find(".") + 1 :],
+            "model": model_id,
             "messages": processed_messages,
             "max_tokens": body.get("max_tokens", 4096),
-            "temperature": body.get("temperature", 0.8),
-            "top_k": body.get("top_k", 40),
-            "top_p": body.get("top_p", 0.9),
             "stop_sequences": body.get("stop", []),
             **({"system": str(system_message)} if system_message else {}),
             "stream": body.get("stream", False),
         }
+
+        # Only include optional parameters if they were explicitly set
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if top_k is not None:
+            payload["top_k"] = top_k
 
         headers = {
             "x-api-key": self.valves.ANTHROPIC_API_KEY,
