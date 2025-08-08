@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe (Async)
 authors: justinh-rahb, christian-taillon, Ryan Kaskel
 author_url: https://github.com/justinh-rahb
 funding_url: https://github.com/open-webui
-version: 1.0.0
+version: 1.1.0
 required_open_webui_version: 0.3.17
 license: MIT
 """
@@ -35,7 +35,7 @@ class Pipe:
         return [
             {"id": "claude-3-5-haiku-latest", "name": "claude-3-5-haiku-latest"},
             {"id": "claude-sonnet-4-20250514", "name": "claude-sonnet-4"},
-            {"id": "claude-opus-4-20250514", "name": "claude-opus-4"},
+            {"id": "claude-opus-4-1-20250805", "name": "claude-opus-4-1"},
         ]
 
     def pipes(self) -> list[dict]:
