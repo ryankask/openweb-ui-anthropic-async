@@ -85,7 +85,7 @@ class Pipe:
     def get_anthropic_models(self) -> list[dict]:
         return [
             {"id": "claude-3-5-haiku-latest", "name": "claude-3-5-haiku-latest"},
-            {"id": "claude-sonnet-4-20250514", "name": "claude-sonnet-4"},
+            {"id": "claude-sonnet-4-5", "name": "claude-sonnet-4-5"},
             {"id": "claude-opus-4-1-20250805", "name": "claude-opus-4-1"},
         ]
 
