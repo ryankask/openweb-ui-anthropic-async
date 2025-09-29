@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe (Async)
 authors: justinh-rahb, christian-taillon, Ryan Kaskel
 author_url: https://github.com/ryankask
 funding_url: https://github.com/open-webui
-version: 2.1.0
+version: 2.2.0
 required_open_webui_version: 0.3.17
 license: MIT
 """
