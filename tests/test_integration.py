@@ -7,6 +7,14 @@ from collections.abc import AsyncGenerator, Iterator
 
 import pytest
 
+from anthropic_async import Pipe
+
+
+@pytest.fixture
+def pipe_without_api_key():
+    """Provide a Pipe instance without requiring an API key."""
+    return Pipe()
+
 
 @pytest.mark.integration
 async def test_basic_non_streaming(pipe_instance, create_text_body, execute_pipe_func):
@@ -126,6 +134,101 @@ async def test_large_image_error(
         assert "size" in str(e).lower()
 
 
+@pytest.mark.asyncio
+async def test_thinking_budget_requires_supported_model(
+    pipe_without_api_key, create_text_body, execute_pipe_func
+):
+    """Thinking budget should be rejected for unsupported models."""
+    body = create_text_body("Check thinking budget", max_tokens=100)
+    body.pop("temperature", None)
+    body["thinking_budget"] = 50
+
+    params = {"body": body}
+
+    with pytest.raises(ValueError) as excinfo:
+        await execute_pipe_func(pipe_without_api_key.pipe, params)
+
+    assert "not supported" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_thinking_budget_blocks_temperature(
+    pipe_without_api_key, create_text_body, execute_pipe_func
+):
+    """Thinking budget must not allow temperature adjustments."""
+    body = create_text_body(
+        "Check temperature with thinking",
+        model="anthropic.claude-sonnet-4-5",
+        max_tokens=100,
+    )
+    body["thinking_budget"] = 50
+
+    params = {"body": body}
+
+    with pytest.raises(ValueError) as excinfo:
+        await execute_pipe_func(pipe_without_api_key.pipe, params)
+
+    assert "temperature" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_thinking_budget_validates_top_p(
+    pipe_without_api_key, create_text_body, execute_pipe_func
+):
+    """Thinking budget should enforce top_p range."""
+    body = create_text_body(
+        "Check top_p with thinking",
+        model="anthropic.claude-sonnet-4-5",
+        max_tokens=200,
+    )
+    body.pop("temperature", None)
+    body["thinking_budget"] = 150
+    body["top_p"] = 0.9
+
+    params = {"body": body}
+
+    with pytest.raises(ValueError) as excinfo:
+        await execute_pipe_func(pipe_without_api_key.pipe, params)
+
+    assert "top_p" in str(excinfo.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_thinking_budget_inserts_payload(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """Thinking budget should be forwarded in the payload when valid."""
+    body = create_text_body(
+        "Enable thinking",
+        model="anthropic.claude-sonnet-4-5",
+        max_tokens=200,
+    )
+    body.pop("temperature", None)
+    body["thinking_budget"] = 100
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("thinking") == {
+        "type": "enabled",
+        "budget_tokens": 100,
+    }
+    assert "temperature" not in captured_payload
+    assert captured_payload["max_tokens"] == 200
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 async def test_concurrent_requests(pipe_instance, create_text_body, execute_pipe_func):
@@ -150,6 +253,6 @@ async def test_concurrent_requests(pipe_instance, create_text_body, execute_pipe
             successful_responses += 1
 
     # At least 2 out of 3 should succeed
-    assert (
-        successful_responses >= 2
-    ), f"Only {successful_responses}/3 concurrent requests succeeded"
+    assert successful_responses >= 2, (
+        f"Only {successful_responses}/3 concurrent requests succeeded"
+    )
