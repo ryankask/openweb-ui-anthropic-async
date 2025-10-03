@@ -14,6 +14,7 @@ import os
 from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import aiohttp
 from pydantic import BaseModel, Field
@@ -87,6 +88,84 @@ class Pipe:
         padding = 2 if b64.endswith("==") else (1 if b64.endswith("=") else 0)
         return (len(b64) * 3) // 4 - padding
 
+    @staticmethod
+    def _extract_text_from_content_block(content_block: Any) -> str:
+        if not isinstance(content_block, dict):
+            return ""
+        text = content_block.get("text")
+        if isinstance(text, str) and text:
+            return text
+        thinking = content_block.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            return thinking
+        items = content_block.get("content")
+        if isinstance(items, list):
+            parts: list[str] = []
+            for item in items:
+                if isinstance(item, dict):
+                    value = (
+                        item.get("text") or item.get("thinking") or item.get("value")
+                    )
+                    if isinstance(value, str):
+                        parts.append(value)
+                elif isinstance(item, str):
+                    parts.append(item)
+            if parts:
+                return "".join(parts)
+        return ""
+
+    @staticmethod
+    def _build_stream_chunk(
+        model: str,
+        *,
+        content: str | None = None,
+        reasoning: str | None = None,
+        finish_reason: str | None = None,
+    ) -> dict[str, Any]:
+        delta: dict[str, Any] = {}
+        if content is not None:
+            delta["content"] = content
+        if reasoning is not None:
+            delta["reasoning_content"] = reasoning
+
+        chunk: dict[str, Any] = {
+            "id": f"anthropic-{uuid4()}",
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": delta,
+                }
+            ],
+        }
+
+        if finish_reason is not None:
+            chunk["choices"][0]["finish_reason"] = finish_reason
+
+        return chunk
+
+    @staticmethod
+    def _build_completion_response(
+        model: str, *, content: str, reasoning: str | None = None
+    ) -> dict[str, Any]:
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning_content"] = reasoning
+
+        return {
+            "id": f"anthropic-{uuid4()}",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
     def get_anthropic_models(self) -> list[dict]:
         return [
             {"id": "claude-3-5-haiku-latest", "name": "claude-3-5-haiku-latest"},
@@ -149,7 +228,9 @@ class Pipe:
                 "source": {"type": "url", "url": url_value},
             }
 
-    async def pipe(self, body: dict) -> str | AsyncGenerator | AsyncIterator:
+    async def pipe(
+        self, body: dict
+    ) -> str | dict[str, Any] | AsyncGenerator | AsyncIterator:
         system_message, messages = pop_system_message(body["messages"])
 
         processed_messages: list[dict] = []
@@ -296,7 +377,9 @@ class Pipe:
 
     async def stream_response(
         self, url: str, headers: dict, payload: dict
-    ) -> AsyncGenerator[str]:
+    ) -> AsyncGenerator[dict[str, Any]]:
+        model = str(payload.get("model", ""))
+        finished = False
         try:
             session = await self._get_session()
             try:
@@ -310,49 +393,91 @@ class Pipe:
                     async for line in response.content:
                         if not line:
                             continue
-                        line = line.decode("utf-8").strip()
-                        if not line or not line.startswith("data: "):
+                        line_text = line.decode("utf-8").strip()
+                        if not line_text or not line_text.startswith("data: "):
                             continue
+
                         try:
-                            data = json.loads(line[6:])
-                            dtype = data.get("type")
-                            if dtype == "content_block_start":
-                                cb = data.get("content_block", {})
-                                if cb.get("type") == "text" and cb.get("text"):
-                                    yield cb["text"]
-                            elif dtype == "content_block_delta":
-                                delta = data.get("delta", {})
-                                if (
-                                    delta.get("type") == "text_delta"
-                                    and "text" in delta
-                                ):
-                                    yield delta["text"]
-                            elif dtype == "message_stop":
-                                break
-                            elif dtype == "message":
-                                for content in data.get("content", []):
-                                    if content.get("type") == "text" and content.get(
-                                        "text"
-                                    ):
-                                        yield content["text"]
-                            # Ignore other event types (ping, message_delta, thinking, tool deltas, etc.)
+                            data = json.loads(line_text[6:])
                         except json.JSONDecodeError:
-                            logger.warning("Failed to parse JSON line: %s", line)
-                        except KeyError as e:
-                            logger.warning(
-                                "Unexpected data structure: %s; data=%s", e, data
+                            logger.warning("Failed to parse JSON line: %s", line_text)
+                            continue
+
+                        if not isinstance(data, dict):
+                            continue
+
+                        dtype = data.get("type")
+                        if dtype == "content_block_start":
+                            content_block = data.get("content_block") or {}
+                            block_type = content_block.get("type")
+                            extracted = self._extract_text_from_content_block(
+                                content_block
                             )
+                            if block_type == "thinking" and extracted:
+                                yield self._build_stream_chunk(
+                                    model, reasoning=extracted
+                                )
+                            elif block_type == "text" and extracted:
+                                yield self._build_stream_chunk(model, content=extracted)
+                        elif dtype == "content_block_delta":
+                            delta = data.get("delta") or {}
+                            delta_type = delta.get("type")
+                            if delta_type == "thinking_delta":
+                                text_piece = delta.get("thinking") or delta.get("text")
+                                if isinstance(text_piece, str) and text_piece:
+                                    yield self._build_stream_chunk(
+                                        model, reasoning=text_piece
+                                    )
+                            elif delta_type == "text_delta":
+                                text_piece = delta.get("text")
+                                if isinstance(text_piece, str) and text_piece:
+                                    yield self._build_stream_chunk(
+                                        model, content=text_piece
+                                    )
+                        elif dtype == "message":
+                            for block in data.get("content", []):
+                                if not isinstance(block, dict):
+                                    continue
+                                block_type = block.get("type")
+                                extracted = self._extract_text_from_content_block(block)
+                                if not extracted:
+                                    continue
+                                if block_type == "thinking":
+                                    yield self._build_stream_chunk(
+                                        model, reasoning=extracted
+                                    )
+                                elif block_type == "text":
+                                    yield self._build_stream_chunk(
+                                        model, content=extracted
+                                    )
+                        elif dtype == "message_stop":
+                            yield self._build_stream_chunk(model, finish_reason="stop")
+                            finished = True
+                            break
+                        # Ignore other event types (ping, message_delta, tool deltas, etc.)
             finally:
                 if not self.valves.REUSE_SESSION and not session.closed:
                     await session.close()
+
+            if not finished:
+                yield self._build_stream_chunk(model, finish_reason="stop")
         except aiohttp.ClientError as e:
             logger.error("Request failed: %s", e)
-            yield f"Error: Request failed: {e}"
+            yield self._build_stream_chunk(
+                model,
+                content=f"Error: Request failed: {e}",
+                finish_reason="stop",
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception("General error in stream_response: %s", e)
-            yield f"Error: {e}"
+            yield self._build_stream_chunk(
+                model, content=f"Error: {e}", finish_reason="stop"
+            )
 
-    async def non_stream_response(self, url: str, headers: dict, payload: dict) -> str:
+    async def non_stream_response(
+        self, url: str, headers: dict, payload: dict
+    ) -> dict[str, Any]:
+        model = str(payload.get("model", ""))
         try:
             session = await self._get_session()
             try:
@@ -364,14 +489,48 @@ class Pipe:
                         )
 
                     res = await response.json()
-                    return (
-                        res["content"][0]["text"]
-                        if "content" in res and res["content"]
-                        else ""
+                    content_blocks = (
+                        res.get("content") if isinstance(res, dict) else None
+                    )
+                    reasoning_fragments: list[str] = []
+                    text_fragments: list[str] = []
+
+                    if isinstance(content_blocks, list):
+                        for block in content_blocks:
+                            if not isinstance(block, dict):
+                                continue
+                            block_type = block.get("type")
+                            extracted = self._extract_text_from_content_block(block)
+                            if not extracted:
+                                continue
+                            if block_type == "thinking":
+                                reasoning_fragments.append(extracted)
+                            elif block_type == "text":
+                                text_fragments.append(extracted)
+
+                    if not text_fragments and isinstance(res, dict):
+                        # Fallback to the first text field if blocks omitted it
+                        first_block = res.get("content", [{}])[0]
+                        if isinstance(first_block, dict):
+                            text_value = first_block.get("text")
+                            if isinstance(text_value, str) and text_value:
+                                text_fragments.append(text_value)
+
+                    content_text = "".join(text_fragments)
+                    reasoning_text = "".join(reasoning_fragments)
+
+                    return self._build_completion_response(
+                        model,
+                        content=content_text,
+                        reasoning=reasoning_text if reasoning_text else None,
                     )
             finally:
                 if not self.valves.REUSE_SESSION and not session.closed:
                     await session.close()
         except aiohttp.ClientError as e:
             logger.error("Failed non-stream request: %s", e)
-            return f"Error: {e}"
+            return {
+                "error": {
+                    "message": f"Error: {e}",
+                }
+            }

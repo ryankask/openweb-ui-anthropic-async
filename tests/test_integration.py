@@ -3,7 +3,7 @@ Integration tests for the async Anthropic pipe using pytest.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator
 
 import pytest
 
@@ -24,9 +24,13 @@ async def test_basic_non_streaming(pipe_instance, create_text_body, execute_pipe
 
     response = await execute_pipe_func(pipe_instance.pipe, params)
 
-    assert isinstance(response, str)
-    assert len(response) > 0
-    assert "hello" in response.lower() or "hi" in response.lower()
+    assert isinstance(response, dict)
+    choices = response.get("choices", [])
+    assert choices
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    assert isinstance(content, str) and content
+    assert "hello" in content.lower() or "hi" in content.lower()
 
 
 @pytest.mark.integration
@@ -38,20 +42,20 @@ async def test_basic_streaming(pipe_instance, create_text_body, execute_pipe_fun
 
     response = await execute_pipe_func(pipe_instance.pipe, params)
 
-    # Collect streaming chunks
-    chunks = []
-    if isinstance(response, AsyncGenerator):
-        async for chunk in response:
-            chunks.append(str(chunk))
-    elif isinstance(response, Iterator):
-        for chunk in response:
-            chunks.append(str(chunk))
-    else:
-        chunks = [str(response)]
+    assert isinstance(response, AsyncGenerator)
 
-    assert len(chunks) > 0
-    full_response = "".join(chunks)
-    assert len(full_response) > 0
+    chunks: list[dict] = []
+    async for chunk in response:
+        chunks.append(chunk)
+
+    assert chunks
+    assert chunks[-1].get("choices", [{}])[0].get("finish_reason") == "stop"
+
+    streamed_text = "".join(
+        chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+        for chunk in chunks
+    )
+    assert streamed_text
 
 
 @pytest.mark.integration
@@ -65,8 +69,12 @@ async def test_system_message(pipe_instance, create_system_body, execute_pipe_fu
 
     response = await execute_pipe_func(pipe_instance.pipe, params)
 
-    assert isinstance(response, str)
-    assert len(response) > 0
+    assert isinstance(response, dict)
+    choices = response.get("choices", [])
+    assert choices
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    assert isinstance(content, str) and content
 
 
 @pytest.mark.integration
@@ -80,8 +88,12 @@ async def test_image_base64(
 
     response = await execute_pipe_func(pipe_instance.pipe, params)
 
-    assert isinstance(response, str)
-    assert len(response) > 0
+    assert isinstance(response, dict)
+    choices = response.get("choices", [])
+    assert choices
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    assert isinstance(content, str) and content
 
 
 @pytest.mark.integration
@@ -95,8 +107,12 @@ async def test_image_url(
 
     response = await execute_pipe_func(pipe_instance.pipe, params)
 
-    assert isinstance(response, str)
-    assert len(response) > 0
+    assert isinstance(response, dict)
+    choices = response.get("choices", [])
+    assert choices
+    message = choices[0].get("message", {})
+    content = message.get("content", "")
+    assert isinstance(content, str) and content
 
 
 @pytest.mark.integration
@@ -229,6 +245,95 @@ async def test_thinking_budget_inserts_payload(
     assert captured_payload["max_tokens"] == 200
 
 
+@pytest.mark.asyncio
+async def test_streaming_surfaces_thinking(pipe_without_api_key, monkeypatch):
+    """Streaming responses expose thinking events alongside text."""
+
+    sse_lines = [
+        'data: {"type":"content_block_start","index":0,"content_block":{"id":"thinking-1","type":"thinking"}}\n\n',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"First thought."},"content_block_id":"thinking-1"}\n\n',
+        'data: {"type":"content_block_stop","index":0,"content_block_id":"thinking-1"}\n\n',
+        'data: {"type":"content_block_start","index":1,"content_block":{"id":"text-1","type":"text"}}\n\n',
+        'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Final answer."},"content_block_id":"text-1"}\n\n',
+        'data: {"type":"message_stop"}\n\n',
+    ]
+
+    class FakeContent:
+        def __init__(self, payloads: list[str]):
+            self._payloads = [payload.encode("utf-8") for payload in payloads]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._payloads:
+                return self._payloads.pop(0)
+            raise StopAsyncIteration
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, lines: list[str]):
+            self._lines = lines
+            self._content: FakeContent | None = None
+
+        async def __aenter__(self):
+            self._content = FakeContent(self._lines)
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def content(self):
+            return self._content
+
+    class FakeSession:
+        def __init__(self, lines: list[str]):
+            self._lines = lines
+            self.closed = False
+
+        def post(self, url, headers=None, json=None):
+            return FakeResponse(self._lines)
+
+        async def close(self):
+            self.closed = True
+
+    captured_session: FakeSession | None = None
+
+    async def fake_get_session(self):
+        nonlocal captured_session
+        captured_session = FakeSession(sse_lines)
+        return captured_session
+
+    monkeypatch.setattr(Pipe, "_get_session", fake_get_session)
+
+    stream = pipe_without_api_key.stream_response("https://example.test", {}, {})
+
+    chunks = []
+    async for chunk in stream:
+        chunks.append(chunk)
+
+    assert len(chunks) == 3
+
+    reasoning_chunk = chunks[0]
+    text_chunk = chunks[1]
+    finish_chunk = chunks[2]
+
+    assert (
+        reasoning_chunk.get("choices", [{}])[0]
+        .get("delta", {})
+        .get("reasoning_content")
+        == "First thought."
+    )
+    assert (
+        text_chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+        == "Final answer."
+    )
+    assert finish_chunk.get("choices", [{}])[0].get("finish_reason") == "stop"
+    assert captured_session is not None and captured_session.closed
+
+
 @pytest.mark.integration
 @pytest.mark.slow
 async def test_concurrent_requests(pipe_instance, create_text_body, execute_pipe_func):
@@ -245,11 +350,13 @@ async def test_concurrent_requests(pipe_instance, create_text_body, execute_pipe
 
     successful_responses = 0
     for response in responses:
-        if (
-            isinstance(response, str)
-            and len(response) > 0
-            and "error" not in response.lower()
-        ):
+        if isinstance(response, dict):
+            choices = response.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                if isinstance(content, str) and content:
+                    successful_responses += 1
+        elif isinstance(response, str) and response and "error" not in response.lower():
             successful_responses += 1
 
     # At least 2 out of 3 should succeed
