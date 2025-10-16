@@ -151,30 +151,13 @@ async def test_large_image_error(
 
 
 @pytest.mark.asyncio
-async def test_thinking_budget_requires_supported_model(
-    pipe_without_api_key, create_text_body, execute_pipe_func
-):
-    """Thinking budget should be rejected for unsupported models."""
-    body = create_text_body("Check thinking budget", max_tokens=100)
-    body.pop("temperature", None)
-    body["thinking_budget"] = 50
-
-    params = {"body": body}
-
-    with pytest.raises(ValueError) as excinfo:
-        await execute_pipe_func(pipe_without_api_key.pipe, params)
-
-    assert "not supported" in str(excinfo.value).lower()
-
-
-@pytest.mark.asyncio
 async def test_thinking_budget_blocks_temperature(
     pipe_without_api_key, create_text_body, execute_pipe_func
 ):
     """Thinking budget must not allow temperature adjustments."""
     body = create_text_body(
         "Check temperature with thinking",
-        model="anthropic.claude-sonnet-4-5",
+        model="anthropic.claude-haiku-4-5",
         max_tokens=100,
     )
     body["thinking_budget"] = 50
@@ -194,7 +177,7 @@ async def test_thinking_budget_validates_top_p(
     """Thinking budget should enforce top_p range."""
     body = create_text_body(
         "Check top_p with thinking",
-        model="anthropic.claude-sonnet-4-5",
+        model="anthropic.claude-haiku-4-5",
         max_tokens=200,
     )
     body.pop("temperature", None)
@@ -216,7 +199,7 @@ async def test_thinking_budget_inserts_payload(
     """Thinking budget should be forwarded in the payload when valid."""
     body = create_text_body(
         "Enable thinking",
-        model="anthropic.claude-sonnet-4-5",
+        model="anthropic.claude-haiku-4-5",
         max_tokens=200,
     )
     body.pop("temperature", None)

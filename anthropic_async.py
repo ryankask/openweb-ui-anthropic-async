@@ -28,10 +28,6 @@ class Pipe:
     API_URL: str = "https://api.anthropic.com/v1/messages"
     API_VERSION: str = "2023-06-01"
     MAX_IMAGE_SIZE: int = 5 * 1024 * 1024  # 5MB per image
-    THINKING_COMPATIBLE_MODELS: set[str] = {
-        "claude-sonnet-4-5",
-        "claude-opus-4-1-20250805",
-    }
     THINKING_TOP_P_MIN: float = 0.95
 
     class Valves(BaseModel):
@@ -168,7 +164,7 @@ class Pipe:
 
     def get_anthropic_models(self) -> list[dict]:
         return [
-            {"id": "claude-3-5-haiku-latest", "name": "claude-3-5-haiku-latest"},
+            {"id": "claude-haiku-4-5", "name": "claude-haiku-4-5"},
             {"id": "claude-sonnet-4-5", "name": "claude-sonnet-4-5"},
             {"id": "claude-opus-4-1-20250805", "name": "claude-opus-4-1"},
         ]
@@ -325,10 +321,6 @@ class Pipe:
                 raise ValueError("thinking_budget must be an integer") from exc
             if thinking_budget <= 0:
                 raise ValueError("thinking_budget must be greater than 0")
-            if model_id not in self.THINKING_COMPATIBLE_MODELS:
-                raise ValueError(
-                    f"Thinking mode is not supported for model '{model_id}'."
-                )
             if temperature is not None:
                 raise ValueError(
                     "temperature cannot be set when thinking mode is enabled"

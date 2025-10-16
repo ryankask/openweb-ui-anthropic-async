@@ -101,7 +101,7 @@ def create_text_body():
 
     def _create_body(
         message: str,
-        model: str = "anthropic.claude-3-5-haiku-latest",
+        model: str = "anthropic.claude-haiku-4-5",
         stream: bool = False,
         max_tokens: int = 25,
     ):
@@ -123,7 +123,7 @@ def create_image_body():
     def _create_body(
         text: str,
         image_data: str,
-        model: str = "anthropic.claude-3-5-haiku-latest",
+        model: str = "anthropic.claude-haiku-4-5",
         max_tokens: int = 20,
     ):
         return {
@@ -152,7 +152,7 @@ def create_system_body():
     def _create_body(
         system: str,
         user_message: str,
-        model: str = "anthropic.claude-3-5-haiku-latest",
+        model: str = "anthropic.claude-haiku-4-5",
         max_tokens: int = 20,
     ):
         return {
