@@ -166,7 +166,7 @@ class Pipe:
         return [
             {"id": "claude-haiku-4-5", "name": "claude-haiku-4-5"},
             {"id": "claude-sonnet-4-5", "name": "claude-sonnet-4-5"},
-            {"id": "claude-opus-4-1-20250805", "name": "claude-opus-4-1"},
+            {"id": "claude-opus-4-5", "name": "claude-opus-4-5"},
         ]
 
     def pipes(self) -> list[dict]:
