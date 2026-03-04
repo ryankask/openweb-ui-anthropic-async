@@ -151,59 +151,36 @@ async def test_large_image_error(
 
 
 @pytest.mark.asyncio
-async def test_thinking_budget_blocks_temperature(
+async def test_effort_invalid_value(
     pipe_without_api_key, create_text_body, execute_pipe_func
 ):
-    """Thinking budget must not allow temperature adjustments."""
+    """Invalid effort values should raise a ValueError."""
     body = create_text_body(
-        "Check temperature with thinking",
-        model="anthropic.claude-haiku-4-5",
+        "Test invalid effort",
+        model="anthropic.claude-sonnet-4-6",
         max_tokens=100,
     )
-    body["thinking_budget"] = 50
+    body["effort"] = "ultra"
 
     params = {"body": body}
 
     with pytest.raises(ValueError) as excinfo:
         await execute_pipe_func(pipe_without_api_key.pipe, params)
 
-    assert "temperature" in str(excinfo.value).lower()
+    assert "effort" in str(excinfo.value).lower()
 
 
 @pytest.mark.asyncio
-async def test_thinking_budget_validates_top_p(
-    pipe_without_api_key, create_text_body, execute_pipe_func
-):
-    """Thinking budget should enforce top_p range."""
-    body = create_text_body(
-        "Check top_p with thinking",
-        model="anthropic.claude-haiku-4-5",
-        max_tokens=200,
-    )
-    body.pop("temperature", None)
-    body["thinking_budget"] = 150
-    body["top_p"] = 0.9
-
-    params = {"body": body}
-
-    with pytest.raises(ValueError) as excinfo:
-        await execute_pipe_func(pipe_without_api_key.pipe, params)
-
-    assert "top_p" in str(excinfo.value).lower()
-
-
-@pytest.mark.asyncio
-async def test_thinking_budget_inserts_payload(
+async def test_effort_inserts_output_config(
     pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
 ):
-    """Thinking budget should be forwarded in the payload when valid."""
+    """effort in body is forwarded as output_config for supported models."""
     body = create_text_body(
-        "Enable thinking",
-        model="anthropic.claude-haiku-4-5",
+        "Test effort payload",
+        model="anthropic.claude-sonnet-4-6",
         max_tokens=200,
     )
-    body.pop("temperature", None)
-    body["thinking_budget"] = 100
+    body["effort"] = "medium"
 
     captured_payload: dict | None = None
 
@@ -220,12 +197,262 @@ async def test_thinking_budget_inserts_payload(
 
     assert response == "ok"
     assert captured_payload is not None
-    assert captured_payload.get("thinking") == {
-        "type": "enabled",
-        "budget_tokens": 100,
-    }
-    assert "temperature" not in captured_payload
+    assert captured_payload.get("output_config") == {"effort": "medium"}
     assert captured_payload["max_tokens"] == 200
+
+
+@pytest.mark.asyncio
+async def test_effort_allows_temperature(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """effort does not restrict temperature; both can be set together."""
+    body = create_text_body(
+        "Test effort with temperature",
+        model="anthropic.claude-sonnet-4-6",
+        max_tokens=200,
+    )
+    body["effort"] = "low"
+    body["temperature"] = 0.5
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("output_config") == {"effort": "low"}
+    assert captured_payload.get("temperature") == 0.5
+
+
+@pytest.mark.asyncio
+async def test_effort_valve_default_applied_for_supported_model(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """Valve DEFAULT_EFFORT is used when effort is not in the request body."""
+    body = create_text_body(
+        "Test valve default effort",
+        model="anthropic.claude-sonnet-4-6",
+        max_tokens=200,
+    )
+    # No "effort" key in body — should fall back to valve default
+    body.pop("effort", None)
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("output_config") == {
+        "effort": pipe_without_api_key.valves.DEFAULT_EFFORT
+    }
+
+
+@pytest.mark.asyncio
+async def test_effort_body_overrides_valve_default(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """Per-request effort in body overrides the Valve DEFAULT_EFFORT."""
+    pipe_without_api_key.valves.DEFAULT_EFFORT = "high"
+
+    body = create_text_body(
+        "Test body overrides valve",
+        model="anthropic.claude-sonnet-4-6",
+        max_tokens=200,
+    )
+    body["effort"] = "low"
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("output_config") == {"effort": "low"}
+
+
+@pytest.mark.asyncio
+async def test_effort_skipped_for_unsupported_model(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """output_config is not sent for models that don't support effort."""
+    body = create_text_body(
+        "Test unsupported model skips effort",
+        model="anthropic.claude-haiku-4-5",
+        max_tokens=200,
+    )
+    # Even if effort is set explicitly, Haiku doesn't support it
+    body["effort"] = "medium"
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert "output_config" not in captured_payload
+
+
+@pytest.mark.asyncio
+async def test_adaptive_thinking_valve_adds_thinking_param(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """When ENABLE_ADAPTIVE_THINKING valve is True, thinking: adaptive is sent for supported models."""
+    pipe_without_api_key.valves.ENABLE_ADAPTIVE_THINKING = True
+
+    body = create_text_body(
+        "Test adaptive thinking valve",
+        model="anthropic.claude-sonnet-4-6",
+        max_tokens=200,
+    )
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("thinking") == {"type": "adaptive"}
+
+
+@pytest.mark.asyncio
+async def test_adaptive_thinking_body_true_overrides_valve_false(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """adaptive_thinking=true in body enables it even when valve is False."""
+    pipe_without_api_key.valves.ENABLE_ADAPTIVE_THINKING = False
+
+    body = create_text_body(
+        "Test body enables adaptive thinking",
+        model="anthropic.claude-sonnet-4-6",
+        max_tokens=200,
+    )
+    body["adaptive_thinking"] = True
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("thinking") == {"type": "adaptive"}
+
+
+@pytest.mark.asyncio
+async def test_adaptive_thinking_body_false_overrides_valve_true(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """adaptive_thinking=false in body disables it even when valve is True."""
+    pipe_without_api_key.valves.ENABLE_ADAPTIVE_THINKING = True
+
+    body = create_text_body(
+        "Test body disables adaptive thinking",
+        model="anthropic.claude-sonnet-4-6",
+        max_tokens=200,
+    )
+    body["adaptive_thinking"] = False
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert "thinking" not in captured_payload
+
+
+@pytest.mark.asyncio
+async def test_adaptive_thinking_skipped_for_unsupported_model(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """thinking param is not sent for models that don't support adaptive thinking."""
+    pipe_without_api_key.valves.ENABLE_ADAPTIVE_THINKING = True
+
+    body = create_text_body(
+        "Test unsupported model skips adaptive thinking",
+        model="anthropic.claude-haiku-4-5",
+        max_tokens=200,
+    )
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert "thinking" not in captured_payload
 
 
 @pytest.mark.asyncio

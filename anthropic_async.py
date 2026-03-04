@@ -3,7 +3,7 @@ title: Anthropic Manifold Pipe (Async)
 authors: justinh-rahb, christian-taillon, Ryan Kaskel
 author_url: https://github.com/ryankask
 funding_url: https://github.com/open-webui
-version: 2.8.0
+version: 3.0.0
 required_open_webui_version: 0.6.33
 license: MIT
 """
@@ -28,13 +28,24 @@ class Pipe:
     API_URL: str = "https://api.anthropic.com/v1/messages"
     API_VERSION: str = "2023-06-01"
     MAX_IMAGE_SIZE: int = 5 * 1024 * 1024  # 5MB per image
-    THINKING_TOP_P_MIN: float = 0.95
+    VALID_EFFORT_LEVELS: frozenset[str] = frozenset({"low", "medium", "high", "max"})
+    EFFORT_SUPPORTED_MODELS: frozenset[str] = frozenset(
+        {"claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"}
+    )
 
     class Valves(BaseModel):
         ANTHROPIC_API_KEY: str = Field(default="")
         REQUEST_TIMEOUT_TOTAL: float = Field(default=60.0)
         REQUEST_TIMEOUT_CONNECT: float = Field(default=3.05)
         REUSE_SESSION: bool = Field(default=False)
+        DEFAULT_EFFORT: str = Field(
+            default="medium",
+            description="Default effort level for supported models (low, medium, high, max).",
+        )
+        ENABLE_ADAPTIVE_THINKING: bool = Field(
+            default=False,
+            description="Send thinking: {type: adaptive} for supported models (Opus 4.6, Sonnet 4.6). Can be overridden per-request via adaptive_thinking in the body.",
+        )
 
     def __init__(self) -> None:
         self.type = "manifold"
@@ -271,7 +282,8 @@ class Pipe:
         temperature = body.get("temperature")
         top_p_raw = body.get("top_p")
         top_k = body.get("top_k")
-        thinking_budget_raw = body.get("thinking_budget")
+        effort = body.get("effort")
+        adaptive_thinking_body = body.get("adaptive_thinking")  # None | bool
 
         top_p: float | None = None
         if top_p_raw is not None:
@@ -314,35 +326,26 @@ class Pipe:
             "stream": stream,
         }
 
-        if thinking_budget_raw is not None:
-            try:
-                thinking_budget = int(thinking_budget_raw)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("thinking_budget must be an integer") from exc
-            if thinking_budget <= 0:
-                raise ValueError("thinking_budget must be greater than 0")
-            if temperature is not None:
+        if model_id in self.EFFORT_SUPPORTED_MODELS:
+            effective_effort = effort if effort is not None else self.valves.DEFAULT_EFFORT
+            if effective_effort not in self.VALID_EFFORT_LEVELS:
                 raise ValueError(
-                    "temperature cannot be set when thinking mode is enabled"
+                    f"effort must be one of: {', '.join(sorted(self.VALID_EFFORT_LEVELS))}"
                 )
-            if top_k is not None:
-                raise ValueError("top_k cannot be set when thinking mode is enabled")
-            if top_p is not None and not (self.THINKING_TOP_P_MIN <= top_p <= 1):
-                raise ValueError(
-                    "When thinking mode is enabled, top_p must be between 0.95 and 1.0"
-                )
-            if thinking_budget >= max_tokens:
-                raise ValueError("thinking_budget must be less than max_tokens")
+            payload["output_config"] = {"effort": effective_effort}
 
-            payload["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-            }
-        else:
-            if temperature is not None:
-                payload["temperature"] = temperature
-            if top_k is not None:
-                payload["top_k"] = top_k
+            use_adaptive = (
+                adaptive_thinking_body
+                if adaptive_thinking_body is not None
+                else self.valves.ENABLE_ADAPTIVE_THINKING
+            )
+            if use_adaptive:
+                payload["thinking"] = {"type": "adaptive"}
+
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if top_k is not None:
+            payload["top_k"] = top_k
 
         if top_p is not None:
             payload["top_p"] = top_p
