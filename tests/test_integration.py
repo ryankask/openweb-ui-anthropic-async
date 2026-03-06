@@ -3,11 +3,45 @@ Integration tests for the async Anthropic pipe using pytest.
 """
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 
+import aiohttp
 import pytest
 
 from anthropic_async import Pipe
+
+
+async def collect_openai_stream_chunks(response):
+    """Collect OpenAI-style chunks from either an async generator or SSE response."""
+
+    chunks: list[dict] = []
+    done_seen = False
+
+    if hasattr(response, "body_iterator"):
+        async for payload in response.body_iterator:
+            if isinstance(payload, bytes):
+                payload = payload.decode("utf-8")
+
+            for event in payload.split("\n\n"):
+                event = event.strip()
+                if not event or not event.startswith("data: "):
+                    continue
+
+                data = event[6:]
+                if data == "[DONE]":
+                    done_seen = True
+                    continue
+
+                chunks.append(json.loads(data))
+
+        return chunks, done_seen
+
+    assert isinstance(response, AsyncGenerator)
+    async for chunk in response:
+        chunks.append(chunk)
+
+    return chunks, done_seen
 
 
 @pytest.fixture
@@ -41,12 +75,7 @@ async def test_basic_streaming(pipe_instance, create_text_body, execute_pipe_fun
     params = {"body": body}
 
     response = await execute_pipe_func(pipe_instance.pipe, params)
-
-    assert isinstance(response, AsyncGenerator)
-
-    chunks: list[dict] = []
-    async for chunk in response:
-        chunks.append(chunk)
+    chunks, _ = await collect_openai_stream_chunks(response)
 
     assert chunks
     assert chunks[-1].get("choices", [{}])[0].get("finish_reason") == "stop"
@@ -151,6 +180,72 @@ async def test_large_image_error(
 
 
 @pytest.mark.asyncio
+async def test_image_url_oversized_head_raises_value_error(
+    pipe_without_api_key, monkeypatch
+):
+    """Oversized remote images are rejected when HEAD reports content-length."""
+
+    class FakeHeadResponse:
+        headers = {"content-length": str(6 * 1024 * 1024)}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class FakeSession:
+        closed = False
+
+        def head(self, url, allow_redirects=True):
+            return FakeHeadResponse()
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_get_session(self):
+        return FakeSession()
+
+    monkeypatch.setattr(Pipe, "_get_session", fake_get_session)
+
+    with pytest.raises(ValueError, match="exceeds 5MB"):
+        await pipe_without_api_key.process_image(
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.test/image.png"},
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_image_url_head_failure_is_tolerated(pipe_without_api_key, monkeypatch):
+    """Remote image HEAD failures do not block passing the URL through."""
+
+    class FakeSession:
+        closed = False
+
+        def head(self, url, allow_redirects=True):
+            raise aiohttp.ClientConnectionError("head failed")
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_get_session(self):
+        return FakeSession()
+
+    monkeypatch.setattr(Pipe, "_get_session", fake_get_session)
+
+    result = await pipe_without_api_key.process_image(
+        {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}
+    )
+
+    assert result == {
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.test/image.png"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_effort_invalid_value(
     pipe_without_api_key, create_text_body, execute_pipe_func
 ):
@@ -199,6 +294,76 @@ async def test_effort_inserts_output_config(
     assert captured_payload is not None
     assert captured_payload.get("output_config") == {"effort": "medium"}
     assert captured_payload["max_tokens"] == 200
+
+
+@pytest.mark.asyncio
+async def test_string_stop_is_normalized_to_stop_sequences(
+    pipe_without_api_key, create_text_body, execute_pipe_func, monkeypatch
+):
+    """OpenAI-style string stop values are normalized to Anthropic stop_sequences."""
+
+    body = create_text_body("Test stop normalization", max_tokens=50)
+    body["stop"] = "END"
+
+    captured_payload: dict | None = None
+
+    async def fake_non_stream(self, url, headers, payload):
+        nonlocal captured_payload
+        captured_payload = payload
+        return "ok"
+
+    monkeypatch.setattr(
+        pipe_without_api_key.__class__, "non_stream_response", fake_non_stream
+    )
+
+    response = await execute_pipe_func(pipe_without_api_key.pipe, {"body": body})
+
+    assert response == "ok"
+    assert captured_payload is not None
+    assert captured_payload.get("stop_sequences") == ["END"]
+
+
+@pytest.mark.asyncio
+async def test_non_stream_maps_finish_reason_from_stop_reason(
+    pipe_without_api_key, monkeypatch
+):
+    """Non-stream responses preserve Anthropic stop_reason semantics."""
+
+    class FakeResponse:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def json(self):
+            return {
+                "content": [{"type": "text", "text": "Partial output"}],
+                "stop_reason": "max_tokens",
+            }
+
+    class FakeSession:
+        closed = False
+
+        def post(self, url, headers=None, json=None):
+            return FakeResponse()
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_get_session(self):
+        return FakeSession()
+
+    monkeypatch.setattr(Pipe, "_get_session", fake_get_session)
+
+    response = await pipe_without_api_key.non_stream_response(
+        "https://example.test", {}, {"model": "claude-haiku-4-5"}
+    )
+
+    assert response["choices"][0]["message"]["content"] == "Partial output"
+    assert response["choices"][0]["finish_reason"] == "length"
 
 
 @pytest.mark.asyncio
@@ -460,11 +625,13 @@ async def test_streaming_surfaces_thinking(pipe_without_api_key, monkeypatch):
     """Streaming responses expose thinking events alongside text."""
 
     sse_lines = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
         'data: {"type":"content_block_start","index":0,"content_block":{"id":"thinking-1","type":"thinking"}}\n\n',
         'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","text":"First thought."},"content_block_id":"thinking-1"}\n\n',
         'data: {"type":"content_block_stop","index":0,"content_block_id":"thinking-1"}\n\n',
         'data: {"type":"content_block_start","index":1,"content_block":{"id":"text-1","type":"text"}}\n\n',
         'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Final answer."},"content_block_id":"text-1"}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":15}}\n\n',
         'data: {"type":"message_stop"}\n\n',
     ]
 
@@ -520,15 +687,18 @@ async def test_streaming_surfaces_thinking(pipe_without_api_key, monkeypatch):
 
     stream = pipe_without_api_key.stream_response("https://example.test", {}, {})
 
-    chunks = []
-    async for chunk in stream:
-        chunks.append(chunk)
+    chunks, done_seen = await collect_openai_stream_chunks(stream)
 
-    assert len(chunks) == 3
+    assert len(chunks) == 4
 
-    reasoning_chunk = chunks[0]
-    text_chunk = chunks[1]
-    finish_chunk = chunks[2]
+    role_chunk = chunks[0]
+    reasoning_chunk = chunks[1]
+    text_chunk = chunks[2]
+    finish_chunk = chunks[3]
+
+    assert (
+        role_chunk.get("choices", [{}])[0].get("delta", {}).get("role") == "assistant"
+    )
 
     assert (
         reasoning_chunk.get("choices", [{}])[0]
@@ -540,8 +710,169 @@ async def test_streaming_surfaces_thinking(pipe_without_api_key, monkeypatch):
         text_chunk.get("choices", [{}])[0].get("delta", {}).get("content")
         == "Final answer."
     )
-    assert finish_chunk.get("choices", [{}])[0].get("finish_reason") == "stop"
+    assert finish_chunk.get("choices", [{}])[0].get("finish_reason") == "length"
     assert captured_session is not None and captured_session.closed
+    assert done_seen or not hasattr(stream, "body_iterator")
+
+
+@pytest.mark.asyncio
+async def test_streaming_coalesces_small_text_deltas(pipe_without_api_key, monkeypatch):
+    """Small adjacent deltas are merged before being forwarded."""
+
+    sse_lines = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+
+    class FakeContent:
+        def __init__(self, payloads: list[str]):
+            self._payloads = [payload.encode("utf-8") for payload in payloads]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._payloads:
+                return self._payloads.pop(0)
+            raise StopAsyncIteration
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, lines: list[str]):
+            self._lines = lines
+            self._content: FakeContent | None = None
+
+        async def __aenter__(self):
+            self._content = FakeContent(self._lines)
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def content(self):
+            return self._content
+
+    class FakeSession:
+        def __init__(self, lines: list[str]):
+            self._lines = lines
+            self.closed = False
+
+        def post(self, url, headers=None, json=None):
+            return FakeResponse(self._lines)
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_get_session(self):
+        return FakeSession(sse_lines)
+
+    monkeypatch.setattr(Pipe, "_get_session", fake_get_session)
+
+    stream = pipe_without_api_key.stream_response("https://example.test", {}, {})
+    chunks, done_seen = await collect_openai_stream_chunks(stream)
+
+    content_chunks = [
+        chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+        for chunk in chunks
+        if chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+    ]
+
+    assert content_chunks == ["Hello there"]
+    assert chunks[-1].get("choices", [{}])[0].get("finish_reason") == "stop"
+    assert done_seen or not hasattr(stream, "body_iterator")
+
+
+@pytest.mark.asyncio
+async def test_streaming_flushes_on_short_pause(pipe_without_api_key, monkeypatch):
+    """A short pause flushes pending text without waiting for a larger batch."""
+
+    pipe_without_api_key.STREAM_BUFFER_CHARS = 50
+    pipe_without_api_key.STREAM_BUFFER_MAX_DELAY_SECONDS = 0.001
+
+    sse_lines = [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4-5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ]
+    delays = [0, 0, 0, 0.01, 0, 0, 0]
+
+    class FakeContent:
+        def __init__(self, payloads: list[str], delays: list[float]):
+            self._payloads = [payload.encode("utf-8") for payload in payloads]
+            self._delays = delays
+            self._index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._index >= len(self._payloads):
+                raise StopAsyncIteration
+
+            delay = self._delays[self._index]
+            if delay:
+                await asyncio.sleep(delay)
+
+            payload = self._payloads[self._index]
+            self._index += 1
+            return payload
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self, lines: list[str], response_delays: list[float]):
+            self._lines = lines
+            self._delays = response_delays
+            self._content: FakeContent | None = None
+
+        async def __aenter__(self):
+            self._content = FakeContent(self._lines, self._delays)
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        @property
+        def content(self):
+            return self._content
+
+    class FakeSession:
+        closed = False
+
+        def post(self, url, headers=None, json=None):
+            return FakeResponse(sse_lines, delays)
+
+        async def close(self):
+            self.closed = True
+
+    async def fake_get_session(self):
+        return FakeSession()
+
+    monkeypatch.setattr(Pipe, "_get_session", fake_get_session)
+
+    stream = pipe_without_api_key.stream_response("https://example.test", {}, {})
+    chunks, done_seen = await collect_openai_stream_chunks(stream)
+
+    content_chunks = [
+        chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+        for chunk in chunks
+        if chunk.get("choices", [{}])[0].get("delta", {}).get("content")
+    ]
+
+    assert content_chunks == ["Hi", " there"]
+    assert done_seen or not hasattr(stream, "body_iterator")
 
 
 @pytest.mark.integration
